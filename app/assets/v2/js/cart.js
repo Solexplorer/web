@@ -345,7 +345,7 @@ Vue.component('grants-cart', {
     },
 
     clearCart() {
-      CartData.setCart([]);
+      CartData.clearCart();
       this.grantData = [];
       update_cart_title();
     },
@@ -360,9 +360,13 @@ Vue.component('grants-cart', {
       update_cart_title();
     },
 
-    addComment(id) {
+    addComment(id, text) {
       // Set comment at this index to an empty string to show textarea
-      this.comments.splice(id, 1, ''); // we use splice to ensure it's reactive
+      this.grantData[id].grant_comments = text ? text : '';
+      CartData.setCart(this.grantData);
+      this.$forceUpdate();
+
+      $('input[type=textarea]').focus();
     },
 
     /**
@@ -641,14 +645,20 @@ Vue.component('grants-cart', {
           localStorage.setItem('contributions_were_successful', 'true');
           localStorage.setItem('contributions_count', String(this.grantData.length));
           var network = document.web3network;
+          let timeout_amount = 1500 + (CartData.loadCart().length * 500);
+
+          _alert('Saving contributions. Please do not leave this page.', 'success', 2000);
 
           setTimeout(function() {
-            if (network === 'rinkeby') {
-              window.location.href = `${window.location.origin}/grants/?network=rinkeby&category=`;
-            } else {
-              window.location.href = `${window.location.origin}/grants`;
-            }
-          }, 1500);
+            _alert('Contributions saved', 'success', 1000);
+            setTimeout(function() {
+              if (network === 'rinkeby') {
+                window.location.href = `${window.location.origin}/grants/?network=rinkeby&category=`;
+              } else {
+                window.location.href = `${window.location.origin}/grants`;
+              }
+            }, 500);
+          }, timeout_amount);
         })
         .on('error', (error, receipt) => {
           // If the transaction was rejected by the network with a receipt, the second parameter will be the receipt.
@@ -829,13 +839,16 @@ Vue.component('grants-cart', {
         for (let i = 0; i < this.grantData.length; i += 1) {
           const verification_required_to_get_match = false;
 
-          if (!document.verified && verification_required_to_get_match) {
+          if (
+            (!document.verified && verification_required_to_get_match) ||
+            grantData.is_clr_eligible == 'False'
+          ) {
             this.grantData[i].grant_donation_clr_match = 0;
           } else {
             const grant = this.grantData[i];
             const matchAmount = await this.predictCLRMatch(grant);
 
-            this.grantData[i].grant_donation_clr_match = matchAmount.toFixed(2);
+            this.grantData[i].grant_donation_clr_match = matchAmount ? matchAmount.toFixed(2) : 0;
           }
         }
       },
