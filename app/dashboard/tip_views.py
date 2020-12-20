@@ -159,7 +159,7 @@ def receive_tip_v3(request, key, txid, network):
     if not request.user.is_authenticated or request.user.is_authenticated and not getattr(
         request.user, 'profile', None
     ):
-        login_redirect = redirect('/login/github?next=' + request.get_full_path())
+        login_redirect = redirect('/login/github/?next=' + request.get_full_path())
         return login_redirect
 
     is_authed = request.user.username.lower() == tip.username.lower() or request.user.username.lower() == tip.from_username.lower() or not tip.username
@@ -225,11 +225,12 @@ def receive_tip_v3(request, key, txid, network):
             messages.error(request, str(e))
             logger.exception(e)
 
+    gas_price_sanity_multiplier = 1.3
     params = {
         'issueURL': request.GET.get('source'),
         'class': 'receive',
         'title': _('Receive Tip'),
-        'gas_price': round(recommend_min_gas_price_to_confirm_in_time(120), 1),
+        'gas_price': round(float(gas_price_sanity_multiplier) * float(recommend_min_gas_price_to_confirm_in_time(1)), 1),
         'tip': tip,
         'has_this_user_redeemed': has_this_user_redeemed,
         'key': key,
@@ -415,37 +416,11 @@ def send_tip_3(request):
         sender_profile=get_profile(from_username),
     )
 
-    is_over_tip_tx_limit = False
-    is_over_tip_weekly_limit = False
-    max_per_tip = request.user.profile.max_tip_amount_usdt_per_tx if request.user.is_authenticated and request.user.profile else 500
-    if tip.value_in_usdt_now:
-        is_over_tip_tx_limit = tip.value_in_usdt_now > max_per_tip
-        if request.user.is_authenticated and request.user.profile:
-            tips_last_week_value = tip.value_in_usdt_now
-            tips_last_week = Tip.objects.send_happy_path().filter(sender_profile=get_profile(from_username), created_on__gt=timezone.now() - timezone.timedelta(days=7))
-            for this_tip in tips_last_week:
-                if this_tip.value_in_usdt_now:
-                    tips_last_week_value += this_tip.value_in_usdt_now
-            is_over_tip_weekly_limit = tips_last_week_value > request.user.profile.max_tip_amount_usdt_per_week
-
-    increase_funding_form_title = _('Request a Funding Limit Increasement')
-    increase_funding_form = f'<a target="_blank" href="{settings.BASE_URL}'\
-                            f'requestincrease">{increase_funding_form_title}</a>'
-
-    if is_over_tip_tx_limit:
-        response['status'] = 'error'
-        response['message'] = _('This tip is over the per-transaction limit of $') +\
-            str(max_per_tip) + '. ' + increase_funding_form
-    elif is_over_tip_weekly_limit:
-        response['status'] = 'error'
-        response['message'] = _('You are over the weekly tip send limit of $') +\
-            str(request.user.profile.max_tip_amount_usdt_per_week) +\
-            '. ' + increase_funding_form
-
     return JsonResponse(response)
 
 
 @ratelimit(key='ip', rate='5/m', method=ratelimit.UNSAFE, block=True)
+@login_required
 def send_tip_2(request):
     """Handle the second stage of sending a tip.
 
@@ -489,6 +464,15 @@ def send_tip_2(request):
             user['avatar_url'] = profile.avatar_baseavatar_related.filter(active=True).first().avatar_url
             user['preferred_payout_address'] = profile.preferred_payout_address
 
+    recent_tips = Tip.objects.filter(sender_profile=request.user.profile).order_by('-created_on')
+    recent_tips_profiles = []
+
+    for tip in recent_tips:
+        if len(recent_tips_profiles) == 7:
+            break
+        if tip.recipient_profile not in recent_tips_profiles:
+            recent_tips_profiles.append(tip.recipient_profile)
+
     params = {
         'issueURL': request.GET.get('source'),
         'class': 'send2',
@@ -497,7 +481,8 @@ def send_tip_2(request):
         'from_handle': from_username,
         'title': 'Send Tip | Gitcoin',
         'card_desc': 'Send a tip to any github user at the click of a button.',
-        'fund_request': fund_request
+        'fund_request': fund_request,
+        'recent_tips_profiles': recent_tips_profiles
     }
 
     if user:

@@ -100,10 +100,6 @@
   outline: none;
 }
 
-.vue-tel-input input {
-  height: 50px;
-}
-
 .vti__dropdown-list.below {
     top: 50px !important;
 }
@@ -119,9 +115,9 @@
 }
 
 .comment-option .radio-label {
-  border: 1px solid #9a96ac;
   color: #9a96ac;
-  padding: 4px 9px;
+  font-weight: 600;
+  background: white;
 }
 
 .comment-option .radio-input:checked + .radio-label,
@@ -129,5 +125,17 @@
   cursor: pointer;
   background-color: #9a96ac;
   color: white !important;
-  font-weight: 600;
+}
+
+.middle-line {
+   width: 100%;
+   text-align: center;
+   border-bottom: 1px solid #ccc;
+   line-height: 0.1em;
+   margin: 10px 0 20px;
+}
+
+.middle-line span {
+  background-color: white;
+  padding:0 10px;
 }

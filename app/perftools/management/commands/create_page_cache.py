@@ -17,6 +17,7 @@
 '''
 
 import json
+import logging
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -29,23 +30,116 @@ from django.utils import timezone
 from django.utils.encoding import force_text
 from django.utils.functional import Promise
 
-from dashboard.models import Profile
+from app.services import RedisService
+from avatar.models import AvatarTheme, CustomAvatar
+from dashboard.models import Activity, HackathonEvent, Profile
+from dashboard.utils import set_hackathon_event
 from economy.models import EncodeAnything, SuperModel
+from grants.models import Contribution, Grant, GrantCategory
+from grants.utils import generate_leaderboard
+from grants.views import next_round_start, round_types
+from marketing.models import Stat
 from perftools.models import JSONStore
+from quests.helpers import generate_leaderboard
+from quests.models import Quest
+from quests.views import current_round_number
 from retail.utils import build_stat_results, programming_languages
+from retail.views import get_contributor_landing_page_context, get_specific_activities
+from townsquare.views import tags
 
+logger = logging.getLogger(__name__)
+
+def create_email_inventory_cache():
+    print('create_email_inventory_cache')
+    from marketing.models import EmailEvent, EmailInventory
+    for ei in EmailInventory.objects.all().exclude(email_tag=''):
+        stats = {}
+        for i in [1, 7, 30]:
+            key = f'{i}d'
+            stats[key] = {}
+            after = timezone.now() - timezone.timedelta(days=i)
+            for what in ['delivered', 'open', 'click']:
+                num = EmailEvent.objects.filter(created_on__gt=after, event=what, category__contains=ei.email_tag).count()
+                stats[key][what] = num
+        ei.stats = stats
+        ei.save()
+
+
+def create_grant_clr_cache():
+    print('create_grant_clr_cache')
+    pks = Grant.objects.values_list('pk', flat=True)
+    for pk in pks:
+        grant = Grant.objects.get(pk=pk)
+        grant.calc_clr_round()
+        grant.save()
+
+def create_grant_type_cache():
+    print('create_grant_type_cache')
+    from grants.views import get_grant_types
+    for network in ['rinkeby', 'mainnet']:
+        view = f'get_grant_types_{network}'
+        keyword = view
+        data = get_grant_types('mainnet', None)
+        with transaction.atomic():
+            JSONStore.objects.filter(view=view).all().delete()
+            JSONStore.objects.create(
+                view=view,
+                key=keyword,
+                data=data,
+                )
+
+
+def create_grant_active_clr_mapping():
+    print('create_grant_active_clr_mapping')
+    # Upate grants mppping to active CLR rounds
+    # NOTE: deprecated; this has been replaced by create_grant_clr_cache
+    # by Owocki 12/16/2020
+    return
+    from grants.models import Grant, GrantCLR
+
+    grants = Grant.objects.all()
+    clr_rounds = GrantCLR.objects.all()
+
+    # remove all old mapping
+    for clr_round in clr_rounds:
+        _grants = clr_round.grants
+        for _grant in grants:
+            _grant.in_active_clrs.remove(clr_round)
+            _grant.save()
+
+    # update new mapping
+    active_clr_rounds = clr_rounds.filter(is_active=True)
+    for clr_round in active_clr_rounds:
+        grants_in_clr_round = grants.filter(**clr_round.grant_filters)
+
+        for grant in grants_in_clr_round:
+            grant_has_mapping_to_round = grant.in_active_clrs.filter(pk=clr_round.pk).exists()
+
+            if not grant_has_mapping_to_round:
+                grant.in_active_clrs.add(clr_round)
+                grant.save()
+
+def create_hack_event_cache():
+    from dashboard.models import HackathonEvent
+    for he in HackathonEvent.objects.all():
+        he.save()
+        
+
+def create_grant_category_size_cache():
+    print('create_grant_category_size_cache')
+    redis = RedisService().redis
+    for category in GrantCategory.objects.all():
+        key = f"grant_category_{category.category}"
+        val = Grant.objects.filter(categories__category__contains=category.category).count()
+        redis.set(key, val)
 
 def create_top_grant_spenders_cache():
-    from marketing.models import Stat
-    from grants.views import next_round_start, round_types
-    from grants.models import Grant, Contribution
     for round_type in round_types:
         contributions = Contribution.objects.filter(
             success=True,
             created_on__gt=next_round_start,
-            subscription__grant__grant_type=round_type
+            subscription__grant__grant_type__name=round_type
             ).values_list('subscription__contributor_profile__handle', 'subscription__amount_per_period_usdt')
-
         count_dict = {ele[0]:0 for ele in contributions}
         sum_dict = {ele[0]:0 for ele in contributions}
         for ele in contributions:
@@ -137,7 +231,6 @@ def create_post_cache():
 
 
 def create_avatar_cache():
-    from avatar.models import AvatarTheme, CustomAvatar
     for at in AvatarTheme.objects.all():
         at.popularity = at.popularity_cheat_by
         if at.name == 'classic':
@@ -151,8 +244,6 @@ def create_avatar_cache():
 
 
 def create_activity_cache():
-    from django.utils import timezone
-    from dashboard.models import Activity
     hours = 24 if not settings.DEBUG else 1000
 
     print('activity.1')
@@ -167,8 +258,7 @@ def create_activity_cache():
         )
 
     print('activity.2')
-    from retail.views import get_specific_activities
-    from townsquare.views import tags
+
     for tag in tags:
         keyword = tag[2]
         data = get_specific_activities(keyword, False, None, None).filter(created_on__gt=timezone.now() - timezone.timedelta(hours=hours)).count()
@@ -180,7 +270,6 @@ def create_activity_cache():
             )
 
 def create_grants_cache():
-    from grants.utils import generate_leaderboard
     print('grants')
     view = 'grants'
     keyword = 'leaderboard'
@@ -193,8 +282,7 @@ def create_grants_cache():
 
 
 def create_quests_cache():
-    from quests.helpers import generate_leaderboard
-    from quests.views import current_round_number
+
     for i in range(1, current_round_number+1):
         print(f'quests_{i}')
         view = 'quests'
@@ -206,9 +294,56 @@ def create_quests_cache():
             data=json.loads(json.dumps(data, cls=EncodeAnything)),
             )
 
-    from quests.models import Quest
     for quest in Quest.objects.filter(visible=True):
         quest.save()
+
+
+def create_hackathon_cache():
+    for hackathon in HackathonEvent.objects.filter(display_showcase=True):
+        hackathon.get_total_prizes(force=True)
+        hackathon.get_total_winners(force=True)
+
+
+def create_hackathon_list_page_cache():
+    print('create_hackathon_list_page_cache')
+
+    view = 'hackathons'
+    keyword = 'hackathons'
+    current_hackathon_events = HackathonEvent.objects.current().filter(visible=True).order_by('-start_date')
+    upcoming_hackathon_events = HackathonEvent.objects.upcoming().filter(visible=True).order_by('-start_date')
+    finished_hackathon_events = HackathonEvent.objects.finished().filter(visible=True).order_by('-start_date')
+
+    events = []
+
+    if current_hackathon_events.exists():
+        for event in current_hackathon_events:
+            events.append(set_hackathon_event('current', event))
+
+    if upcoming_hackathon_events.exists():
+        for event in upcoming_hackathon_events:
+            events.append(set_hackathon_event('upcoming', event))
+
+    if finished_hackathon_events.exists():
+        for event in finished_hackathon_events:
+            events.append(set_hackathon_event('finished', event))
+
+    default_tab = None
+
+    if current_hackathon_events.exists():
+        default_tab = 'current'
+    elif upcoming_hackathon_events.exists():
+        default_tab = 'upcoming'
+    else:
+        default_tab = 'finished'
+
+    with transaction.atomic():
+        JSONStore.objects.filter(view=view).all().delete()
+        data = [default_tab, events]
+        JSONStore.objects.create(
+            view=view,
+            key=keyword,
+            data=data,
+            )
 
 
 def create_results_cache():
@@ -238,7 +373,6 @@ def create_contributor_landing_page_context():
     if settings.DEBUG:
         keywords = ['']
     view = 'contributor_landing_page'
-    from retail.views import get_contributor_landing_page_context
     with transaction.atomic():
         items = []
         JSONStore.objects.filter(view=view).all().delete()
@@ -260,14 +394,31 @@ class Command(BaseCommand):
     help = 'generates some /results data'
 
     def handle(self, *args, **options):
-        create_results_cache()
+        operations = []
+        operations.append(create_grant_type_cache)
+        operations.append(create_grant_clr_cache)
+        operations.append(create_grant_category_size_cache)
         if not settings.DEBUG:
-            create_hidden_profiles_cache()
-            create_tribes_cache()
-            create_activity_cache()
-            create_post_cache()
-            create_top_grant_spenders_cache()
-            create_avatar_cache()
-            create_quests_cache()
-            create_grants_cache()
-            create_contributor_landing_page_context()
+            operations.append(create_results_cache)
+            operations.append(create_hack_event_cache)
+            operations.append(create_hidden_profiles_cache)
+            operations.append(create_tribes_cache)
+            operations.append(create_activity_cache)
+            operations.append(create_post_cache)
+            operations.append(create_top_grant_spenders_cache)
+            operations.append(create_avatar_cache)
+            operations.append(create_quests_cache)
+            operations.append(create_grants_cache)
+            operations.append(create_contributor_landing_page_context)
+            operations.append(create_hackathon_cache)
+            operations.append(create_hackathon_list_page_cache)
+            hour = int(timezone.now().strftime('%H'))
+            if hour < 4:
+                # do dailyi updates
+                operations.append(create_email_inventory_cache)
+        for func in operations:
+            try:
+                print(f'running {func}')
+                func()
+            except Exception as e:
+                logger.exception(e)

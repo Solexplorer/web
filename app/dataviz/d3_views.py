@@ -750,6 +750,8 @@ def mesh_network_viz(request, ):
     start_date = timezone.datetime(year, month, day, 1, tzinfo=pytz.UTC)
     end_date = timezone.datetime(to_year, to_month, to_day, 23, 59, tzinfo=pytz.UTC)
     _type = request.GET.get('type', 'all')
+    theme = request.GET.get('theme', 'light')
+    show_labels = request.GET.get('show_labels', '0')
 
     since = f"{year}/{month}/{day}"
 
@@ -801,12 +803,16 @@ def mesh_network_viz(request, ):
         "since": since,
         "year": year,
         "month": month,
+        "show_labels": show_labels,
+        "theme": theme,
+        "themes": ['light', 'dark'],
+        "show_labels_options": ['1', '0'],
         "day": day,
         "to_year": to_year,
         "to_month": to_month,
         "to_day": to_day,
         "years": range(2017, 1 + int(timezone.now().strftime("%Y"))),
-        "months": range(1, 12),
+        "months": range(1, 13),
         "days": range(1, 31),
         'types': ['all', 'grant', 'bounty', 'tip', 'kudos']
     }

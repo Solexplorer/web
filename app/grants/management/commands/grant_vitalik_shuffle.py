@@ -22,8 +22,7 @@ import random
 
 from django.core.management.base import BaseCommand
 
-from grants.models import Grant
-from grants.views import clr_active
+from grants.models import Grant, GrantCLR
 
 # VB 2019/09/27
 # > To prevent a winner-takes-all effect from grants with already the most funding being shown at the top, how about a randomized sort, where your probability of being first is equal to (your expected CLR match) / (total expected CLR match) and then you just do that recursively to position everyone?
@@ -55,9 +54,14 @@ class Command(BaseCommand):
     help = 'grant weighted shuffle'
 
     def handle(self, *args, **options):
+        min_weight = 1
+        max_weight = 5000
 
-        if not clr_active:
+        active_clr_rounds = GrantCLR.objects.filter(is_active=True)
+        if active_clr_rounds.count() == 0:
             return
+
+        # TODO-SELF-SERVICE: Check if it's alright to shuffle all grants even if 1 CLR round is active
 
         # set default, for when no CLR match enabled
         for grant in Grant.objects.all():
@@ -65,8 +69,14 @@ class Command(BaseCommand):
             grant.save()
 
         # get grants, and apply weighted shuffle rank to them
-        grants = Grant.objects.filter(clr_prediction_curve__0__1__isnull=False).order_by('pk')
-        weighted_list = [(grant, int(max(1, grant.clr_prediction_curve[0][1]))) for grant in grants]
+        grants = Grant.objects.filter(clr_prediction_curve__0__1__isnull=False, is_clr_active=True).order_by('pk')
+        weighted_list = []
+        for grant in grants:
+            try:
+                weight = int(max(min_weight, min(max_weight, grant.clr_prediction_curve[0][1])))
+                weighted_list.append([grant, weight])
+            except Exception as e:
+                print(e)
         og_weighted_list = weighted_list.copy()
         ws = weighted_shuffle(weighted_list)
         counter = 0
@@ -75,6 +85,7 @@ class Command(BaseCommand):
         for ele in ws:
             grant_idx = custom_index(og_weighted_list, ele)
             grant = grants[grant_idx]
+            grant.random_shuffle = random.randint(0, 99999999)
             grant.weighted_shuffle = counter
             grant.save()
             counter+=1

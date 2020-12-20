@@ -35,8 +35,8 @@ class GeneralAdmin(admin.ModelAdmin):
 
 class TokenRequestAdmin(admin.ModelAdmin):
     ordering = ['-id']
-    search_fields = ['profile', 'name']
-    list_display = ['pk', 'profile', 'created_on', '__str__']
+    search_fields = ['profile__handle', 'name']
+    list_display = ['pk', 'profile', 'network', 'created_on', '__str__']
     raw_id_fields = ['profile']
     readonly_fields = ['preview']
 
@@ -47,13 +47,15 @@ class TokenRequestAdmin(admin.ModelAdmin):
             notify_kudos_rejected(obj)
             self.message_user(request, f"Notified user of rejection")
             return redirect('/_administrationkudos/tokenrequest/?approved=f&rejection_reason=')
-        if "_change_owner" in request.POST:
+        if "_change_owner" in request.POST or request.POST.get('_change_owner_mint_kudos', False):
             obj.to_address = '0x6239FF1040E412491557a7a02b2CBcC5aE85dc8F'
             obj.save()
             self.message_user(request, f"Changed owner to gitcoin")
-        if "_mint_kudos" in request.POST:
+        if "_mint_kudos" in request.POST or request.POST.get('_change_owner_mint_kudos', False):
             from kudos.tasks import mint_token_request
             try:
+                obj.rejection_reason = 'n/a'
+                obj.save()
                 mint_token_request.delay(obj.id)
                 self.message_user(request, f"Mint/sync submitted to chain")
             except Exception as e:
@@ -77,6 +79,7 @@ class BulkTransferCouponAdmin(admin.ModelAdmin):
     list_display = ['created_on', '__str__']
     raw_id_fields = ['sender_profile', 'token']
     readonly_fields = ['claim']
+    search_fields = ['comments_to_put_in_kudos_transfer', 'secret', 'token__name']
 
     def claim(self, instance):
         url = instance.url
@@ -93,10 +96,15 @@ class TokenAdmin(admin.ModelAdmin):
     ordering = ['-id']
     search_fields = ['name', 'description']
     raw_id_fields = ['contract']
-    readonly_fields = ['link', 'view_count']
+    readonly_fields = ['links', 'view_count']
 
-    def link(self, instance):
+    def links(self, instance):
         html = f"<a href={instance.url}>{instance.url}</a>"
+        other_items = instance.on_networks
+        if other_items:
+            html += "<BR>also avaialble on :"
+        for oi in other_items:
+            html += f"<BR> - <a href='{oi[1].url}'>{oi[0]}</a>"
         return mark_safe(html)
 
     def view_count(self, instance):
@@ -133,6 +141,14 @@ class TransferAdmin(admin.ModelAdmin):
     readonly_fields = ['claim']
     search_fields = ['tokenName', 'comments_public', 'from_name', 'username', 'network', 'github_url', 'url', 'emails', 'from_address', 'receive_address', 'txid', 'receive_txid']
     list_display = ['created_on', '__str__']
+
+    def response_change(self, request, obj):
+        from django.shortcuts import redirect
+        if "_broadcast_txn" in request.POST:
+            from kudos.tasks import redeem_bulk_kudos
+            redeem_bulk_kudos.delay(obj.pk, send_notif_email=True)
+            self.message_user(request, f"submitted broadcast to queues")
+            return redirect(obj.admin_url)
 
     def claim(self, instance):
         if instance.web3_type == 'yge':

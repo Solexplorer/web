@@ -17,26 +17,37 @@ You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 """
+import json
 import logging
+import traceback
 from datetime import timedelta
 from decimal import Decimal
+from io import BytesIO
 
 from django.conf import settings
+from django.contrib.humanize.templatetags.humanize import naturaltime
 from django.contrib.postgres.fields import ArrayField, JSONField
+from django.core import serializers
+from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.db import models
 from django.db.models import Q
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
+from django.templatetags.static import static
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.timezone import localtime
 from django.utils.translation import gettext_lazy as _
 
 import pytz
+import requests
 from django_extensions.db.fields import AutoSlugField
-from economy.models import SuperModel
+from economy.models import SuperModel, Token
 from economy.utils import ConversionRateNotFoundError, convert_amount
 from gas.utils import eth_usd_conv_rate, recommend_min_gas_price_to_confirm_in_time
-from grants.utils import get_upload_filename
+from grants.utils import generate_collection_thumbnail, get_upload_filename, is_grant_team_member
+from townsquare.models import Favorite
 from web3 import Web3
 
 logger = logging.getLogger(__name__)
@@ -71,47 +82,8 @@ class GrantQuerySet(models.QuerySet):
             Q(reference_url__icontains=keyword)
         )
 
+
 class GrantCategory(SuperModel):
-    @staticmethod
-    def all_categories():
-        all_tech_categories = GrantCategory.tech_categories()
-        filtered_media_categories = [category for category in GrantCategory.media_categories() if category not in all_tech_categories]
-        return all_tech_categories + filtered_media_categories + GrantCategory.health_categories() + GrantCategory.change_categories()
-
-    @staticmethod
-    def tech_categories():
-        return [
-            'security',
-            'scalability',
-            'defi',
-            'education',
-            'wallets',
-            'community',
-            'eth2.0',
-            'eth1.x',
-        ]
-
-    @staticmethod
-    def media_categories():
-        return [
-            'education',
-            'twitter',
-            'reddit',
-            'blog',
-            'notes',
-        ]
-
-    @staticmethod
-    def health_categories():
-        return [
-            'COVID19 research',
-            'COVID19 response',
-        ]
-
-    @staticmethod
-    def change_categories():
-        return [
-        ]
 
     category = models.CharField(
         max_length=50,
@@ -125,6 +97,154 @@ class GrantCategory(SuperModel):
         return f"{self.category}"
 
 
+class GrantType(SuperModel):
+
+    name = models.CharField(unique=True, max_length=15, help_text="Grant Type")
+    label = models.CharField(max_length=25, null=True, help_text="Display Name")
+    is_active = models.BooleanField(default=True, db_index=True, help_text="Is Grant Type currently active")
+    categories  = models.ManyToManyField(
+        GrantCategory,
+        help_text="Grant Categories associated with Grant Type"
+    )
+    logo = models.ImageField(
+        upload_to=get_upload_filename,
+        null=True,
+        blank=True,
+        max_length=500,
+        help_text=_('The default category\'s marketing banner (aspect ratio = 10:3)'),
+    )
+
+
+    def __str__(self):
+        """Return the string representation."""
+        return f"{self.name}"
+
+    @property
+    def clrs(self):
+        return GrantCLR.objects.filter(grant_filters__grant_type=str(self.pk))
+
+    @property
+    def active_clrs(self):
+        return GrantCLR.objects.filter(is_active=True, grant_filters__grant_type=str(self.pk))
+
+    @property
+    def active_clrs_sum(self):
+        return sum(self.active_clrs.values_list('total_pot', flat=True))
+
+
+class GrantCLR(SuperModel):
+
+    class Meta:
+        unique_together = ('customer_name', 'round_num', 'sub_round_slug',)
+
+    customer_name = models.CharField(
+        max_length=15,
+        default='',
+        blank=True,
+        help_text="used to genrate customer_name/round_num/sub_round_slug"
+    )
+    round_num = models.PositiveIntegerField(
+        help_text="CLR Round Number. used to generate customer_name/round_num/sub_round_slug"
+    )
+    sub_round_slug = models.CharField(
+        max_length=25,
+        default='',
+        blank=True,
+        help_text="used to generate customer_name/round_num/sub_round_slug"
+    )
+    display_text = models.CharField(
+        max_length=15,
+        null=True,
+        blank=True,
+        help_text="sets the custom text in CLR banner on the landing page"
+    )
+    owner = models.ForeignKey(
+        'dashboard.Profile',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        help_text='sets the owners profile photo in CLR banner on the landing page'
+    )
+    is_active = models.BooleanField(default=False, db_index=True, help_text="Is CLR Round currently active")
+    start_date = models.DateTimeField(help_text="CLR Round Start Date")
+    end_date = models.DateTimeField(help_text="CLR Round End Date")
+    grant_filters = JSONField(
+        default=dict,
+        null=True, blank=True,
+        help_text="Grants allowed in this CLR round"
+    )
+    subscription_filters = JSONField(
+        default=dict,
+        null=True, blank=True,
+        help_text="Grant Subscription to be allowed in this CLR round"
+    )
+    collection_filters = JSONField(
+        default=dict,
+        null=True, blank=True,
+        help_text="Grant Collections to be allowed in this CLR round"
+    )
+    verified_threshold = models.DecimalField(
+        help_text="This is the verfied CLR threshold. You can generally increase the saturation of the round / increase the CLR match by increasing this value, as it has a proportional relationship. However, depending on the pair totals by grant, it may reduce certain matches. In any case, please use the contribution multiplier first.",
+        default=25.0,
+        decimal_places=2,
+        max_digits=5
+    )
+    unverified_threshold = models.DecimalField(
+        help_text="This is the unverified CLR threshold. The relationship with the CLR match is the same as the verified threshold. If you would like to increase the saturation of round / increase the CLR match, increase this value, but please use the contribution multiplier first.",
+        default=5.0,
+        decimal_places=2,
+        max_digits=5
+    )
+    total_pot = models.DecimalField(
+        help_text="Total CLR Pot",
+        default=0,
+        decimal_places=2,
+        max_digits=10
+    )
+    contribution_multiplier = models.DecimalField(
+        help_text="This contribution multipler is applied to each contribution before running CLR calculations. In order to increase the saturation, please increase this value first, before modifying the thresholds.",
+        default=1.0,
+        decimal_places=4,
+        max_digits=10
+    )
+    logo = models.ImageField(
+        upload_to=get_upload_filename,
+        null=True,
+        blank=True,
+        max_length=500,
+        help_text=_('sets the background in CLR banner on the landing page'),
+    )
+
+    def __str__(self):
+        return f"{self.round_num}"
+
+    @property
+    def grants(self):
+
+        grants = Grant.objects.filter(hidden=False, active=True, is_clr_eligible=True, link_to_new_grant=None)
+        if self.grant_filters:
+            grants = grants.filter(**self.grant_filters)
+        if self.subscription_filters:
+            grants = grants.filter(**self.subscription_filters)
+        if self.collection_filters:
+            grants = grants.filter(**self.collection_filters)
+
+        return grants
+
+
+    def record_clr_prediction_curve(self, grant, clr_prediction_curve):
+        for obj in self.clr_calculations.filter(grant=grant):
+            obj.latest = False
+            obj.save()
+
+        GrantCLRCalculation.objects.create(
+            grantclr=self,
+            grant=grant,
+            clr_prediction_curve=clr_prediction_curve,
+            latest=True,
+        )
+
+
 class Grant(SuperModel):
     """Define the structure of a Grant."""
 
@@ -133,22 +253,35 @@ class Grant(SuperModel):
 
         ordering = ['-created_on']
 
-    GRANT_TYPES = [
-        ('tech', 'tech'),
-        ('health', 'health'),
-        ('media', 'Community'),
-        ('change', 'change'),
-        ('matic', 'matic')
+
+    REGIONS = [
+        ('north_america', 'North America'),
+        ('oceania', 'Oceania'),
+        ('latin_america', 'Latin America'),
+        ('europe', 'Europe'),
+        ('africa', 'Africa'),
+        ('middle_east', 'Middle East'),
+        ('india', 'India'),
+        ('east_asia', 'East Asia'),
+        ('southeast_asia', 'Southeast Asia')
     ]
 
-    active = models.BooleanField(default=True, help_text=_('Whether or not the Grant is active.'))
-    grant_type = models.CharField(max_length=15, choices=GRANT_TYPES, default='tech', help_text=_('Grant CLR category'))
+    active = models.BooleanField(default=True, help_text=_('Whether or not the Grant is active.'), db_index=True)
+    grant_type = models.ForeignKey(GrantType, on_delete=models.CASCADE, null=True, help_text="Grant Type")
     title = models.CharField(default='', max_length=255, help_text=_('The title of the Grant.'))
     slug = AutoSlugField(populate_from='title')
     description = models.TextField(default='', blank=True, help_text=_('The description of the Grant.'))
     description_rich = models.TextField(default='', blank=True, help_text=_('HTML rich description.'))
     reference_url = models.URLField(blank=True, help_text=_('The associated reference URL of the Grant.'))
+    github_project_url = models.URLField(blank=True, null=True, help_text=_('Grant Github Project URL'))
     is_clr_eligible = models.BooleanField(default=True, help_text="Is grant eligible for CLR")
+    region = models.CharField(
+        max_length=30,
+        null=True,
+        blank=True,
+        choices=REGIONS,
+        help_text="region to which grant belongs to"
+    )
     link_to_new_grant = models.ForeignKey(
         'grants.Grant',
         null=True,
@@ -159,6 +292,7 @@ class Grant(SuperModel):
         upload_to=get_upload_filename,
         null=True,
         blank=True,
+        max_length=500,
         help_text=_('The Grant logo image.'),
     )
     logo_svg = models.FileField(
@@ -167,11 +301,23 @@ class Grant(SuperModel):
         blank=True,
         help_text=_('The Grant logo SVG.'),
     )
+    # TODO-GRANTS: rename to eth_payout_address
     admin_address = models.CharField(
         max_length=255,
         default='0x0',
+        null=True,
+        blank=True,
+        db_index=True,
         help_text=_('The wallet address where subscription funds will be sent.'),
     )
+    zcash_payout_address = models.CharField(
+        max_length=255,
+        default='0x0',
+        null=True,
+        blank=True,
+        help_text=_('The zcash wallet address where subscription funds will be sent.'),
+    )
+    # TODO-GRANTS: remove
     contract_owner_address = models.CharField(
         max_length=255,
         default='0x0',
@@ -195,6 +341,7 @@ class Grant(SuperModel):
         max_digits=50,
         help_text=_('The total amount received for the Grant in USDT/DAI.'),
     )
+    # TODO-GRANTS: remove
     token_address = models.CharField(
         max_length=255,
         default='0x0',
@@ -205,16 +352,19 @@ class Grant(SuperModel):
         default='',
         help_text=_('The token symbol to be used with the Grant.'),
     )
+    # TODO-GRANTS: remove
     contract_address = models.CharField(
         max_length=255,
         default='0x0',
         help_text=_('The contract address of the Grant.'),
     )
+    # TODO-GRANTS: remove
     deploy_tx_id = models.CharField(
         max_length=255,
         default='0x0',
         help_text=_('The transaction id for contract deployment.'),
     )
+    # TODO-GRANTS: remove
     cancel_tx_id = models.CharField(
         max_length=255,
         default='0x0',
@@ -236,6 +386,7 @@ class Grant(SuperModel):
         max_length=8,
         default='mainnet',
         help_text=_('The network in which the Grant contract resides.'),
+        db_index=True
     )
     required_gas_price = models.DecimalField(
         default='0',
@@ -256,34 +407,21 @@ class Grant(SuperModel):
         help_text=_('The team members contributing to this Grant.'),
     )
     image_css = models.CharField(default='', blank=True, max_length=255, help_text=_('additional CSS to attach to the grant-banner img.'))
-    clr_matching = models.DecimalField(
-        default=0,
-        decimal_places=2,
-        max_digits=20,
-        help_text=_('The TOTAL CLR matching amount across all rounds'),
-    )
     amount_received_with_phantom_funds = models.DecimalField(
         default=0,
         decimal_places=2,
         max_digits=20,
         help_text=_('The fundingamount across all rounds with phantom funding'),
     )
-    clr_prediction_curve = ArrayField(
-        ArrayField(
-            models.FloatField(),
-            size=2,
-        ), blank=True, default=list, help_text=_('5 point curve to predict CLR donations.'))
-    backup_clr_prediction_curve = ArrayField(
-        ArrayField(
-            models.FloatField(),
-            size=2,
-        ), blank=True, default=list, help_text=_('backup 5 point curve to predict CLR donations - used to store a secondary backup of the clr prediction curve, in the case a new identity mechanism is used'))
     activeSubscriptions = ArrayField(models.CharField(max_length=200), blank=True, default=list)
-    hidden = models.BooleanField(default=False, help_text=_('Hide the grant from the /grants page?'))
-    weighted_shuffle = models.PositiveIntegerField(blank=True, null=True)
+    hidden = models.BooleanField(default=False, help_text=_('Hide the grant from the /grants page?'), db_index=True)
+    random_shuffle = models.PositiveIntegerField(blank=True, null=True, db_index=True)
+    weighted_shuffle = models.PositiveIntegerField(blank=True, null=True, db_index=True)
     contribution_count = models.PositiveIntegerField(blank=True, default=0)
     contributor_count = models.PositiveIntegerField(blank=True, default=0)
+    # TODO-GRANTS: remove
     positive_round_contributor_count = models.PositiveIntegerField(blank=True, default=0)
+    # TODO-GRANTS: remove
     negative_round_contributor_count = models.PositiveIntegerField(blank=True, default=0)
 
     defer_clr_to = models.ForeignKey(
@@ -293,16 +431,19 @@ class Grant(SuperModel):
         help_text=_('The Grant that this grant defers it CLR contributions to (if any).'),
         null=True,
     )
+    # TODO-CROSS-GRANT: [{round: fk1, value: time}]
     last_clr_calc_date = models.DateTimeField(
         help_text=_('The last clr calculation date'),
         null=True,
         blank=True,
     )
+    # TODO-CROSS-GRANT: [{round: fk1, value: time}]
     next_clr_calc_date = models.DateTimeField(
         help_text=_('The last clr calculation date'),
         null=True,
         blank=True,
     )
+    # TODO-CROSS-GRANT: [{round: fk1, value: time}]
     last_update = models.DateTimeField(
         help_text=_('The last grant admin update date'),
         null=True,
@@ -313,6 +454,38 @@ class Grant(SuperModel):
     twitter_handle_2 = models.CharField(default='', max_length=255, help_text=_('Grants twitter handle'), blank=True)
     twitter_handle_1_follower_count = models.PositiveIntegerField(blank=True, default=0)
     twitter_handle_2_follower_count = models.PositiveIntegerField(blank=True, default=0)
+    sybil_score = models.DecimalField(
+        default=0,
+        decimal_places=4,
+        max_digits=50,
+        help_text=_('The Grants Sybil Score'),
+    )
+
+    funding_info = models.CharField(default='', blank=True, null=True, max_length=255, help_text=_('Is this grant VC funded?'))
+
+    clr_prediction_curve = ArrayField(
+        ArrayField(
+            models.FloatField(),
+            size=2,
+        ), blank=True, default=list, help_text=_('5 point curve to predict CLR donations.'))
+
+    weighted_risk_score = models.DecimalField(
+        default=0,
+        decimal_places=4,
+        max_digits=50,
+        help_text=_('The Grants Weighted Risk Score'),
+    )
+
+    in_active_clrs = models.ManyToManyField(
+        GrantCLR,
+        help_text="Active Grants CLR Round"
+    )
+    is_clr_active = models.BooleanField(default=False, help_text=_('CLR Round active or not? (auto computed)'))
+    clr_round_num = models.CharField(default='', max_length=255, help_text=_('the CLR round number thats active'), blank=True)
+
+    twitter_verified = models.BooleanField(default=False, help_text='The owner grant has verified the twitter account')
+    twitter_verified_by = models.ForeignKey('dashboard.Profile', null=True, blank=True, on_delete=models.SET_NULL, help_text='Team member who verified this grant')
+    twitter_verified_at = models.DateTimeField(blank=True, null=True, help_text='At what time and date what verified this grant')
 
     # Grant Query Set used as manager.
     objects = GrantQuerySet.as_manager()
@@ -322,6 +495,71 @@ class Grant(SuperModel):
         return f"id: {self.pk}, active: {self.active}, title: {self.title}, type: {self.grant_type}"
 
 
+    def calc_clr_round(self):
+        clr_round = None
+
+        # create_grant_active_clr_mapping
+        clr_rounds = GrantCLR.objects.filter(is_active=True)
+        for this_clr_round in clr_rounds:
+            if self in this_clr_round.grants.all():
+                self.in_active_clrs.add(this_clr_round)
+            else:
+                self.in_active_clrs.remove(this_clr_round)
+
+        # create_grant_clr_cache
+        if self.in_active_clrs.count() > 0 and self.is_clr_eligible:
+            clr_round = self.in_active_clrs.first()
+
+        if clr_round:
+            self.is_clr_active = True
+            self.clr_round_num = clr_round.round_num
+        else:
+            self.is_clr_active = False
+            self.clr_round_num = ''
+
+
+    @property
+    def tenants(self):
+        """returns list of chains the grant can recieve contributions in"""
+        tenants = []
+        # TODO: rename to eth_payout_address
+        if self.admin_address and self.admin_address != '0x0':
+            tenants.append('ETH')
+        if self.zcash_payout_address and self.zcash_payout_address != '0x0':
+            tenants.append('ZCASH')
+
+        return tenants
+
+
+    @property
+    def calc_clr_round_nums(self):
+        if self.pk:
+            round_nums = [ele for ele in self.in_active_clrs.values_list('sub_round_slug', flat=True)]
+            return ", ".join(round_nums)
+        return ''
+
+
+    @property
+    def calc_clr_prediction_curve(self):
+        # [amount_donated, match amount, bonus_from_match_amount ], etc..
+        # [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        _clr_prediction_curve = []
+        for insert_clr_calc in self.clr_calculations.filter(latest=True).order_by('-created_on'):
+            insert_clr_calc = insert_clr_calc.clr_prediction_curve
+            if not _clr_prediction_curve:
+                _clr_prediction_curve = insert_clr_calc
+            else:
+                for j in [1,2]:
+                    for i in [0,1,2,3,4,5]:
+                        # add the 1 and 2 index of each clr prediction cuve
+                        _clr_prediction_curve[i][j] += insert_clr_calc[i][j]
+
+        if not _clr_prediction_curve:
+            _clr_prediction_curve = [[0.0, 0.0, 0.0] for x in range(0, 6)]
+
+        return _clr_prediction_curve
+
+
     def updateActiveSubscriptions(self):
         """updates the active subscriptions list"""
         handles = []
@@ -329,10 +567,27 @@ class Grant(SuperModel):
             handles.append(handle)
         self.activeSubscriptions = handles
 
+    @property
+    def safe_next_clr_calc_date(self):
+        if self.next_clr_calc_date and self.next_clr_calc_date < timezone.now():
+            return timezone.now() + timezone.timedelta(minutes=5)
+        return self.next_clr_calc_date
 
     @property
     def recurring_funding_supported(self):
         return self.contract_version < 2
+
+    @property
+    def related_grants(self):
+        pkg = self.metadata.get('related', [])
+        pks = [ele[0] for ele in pkg]
+        rg = Grant.objects.filter(pk__in=pks)
+        return_me = []
+        for ele in pkg:
+            grant = rg.get(pk=ele[0])
+            return_me.append([grant, ele[1]])
+        return return_me
+
 
     @property
     def configured_to_receieve_funding(self):
@@ -417,6 +672,7 @@ class Grant(SuperModel):
 
     @property
     def history_by_month(self):
+        import math
         # gets the history of contributions to this grant month over month so they can be shown o grant details
         # returns [["", "Subscription Billing",  "New Subscriptions", "One-Time Contributions", "CLR Matching Funds"], ["December 2017", 5534, 2011, 0, 0], ["January 2018", 10396, 0 , 0, 0 ], ... for each monnth in which this grant has contribution history];
         CLR_PAYOUT_HANDLES = ['vs77bb', 'gitcoinbot', 'notscottmoore', 'owocki']
@@ -426,31 +682,21 @@ class Grant(SuperModel):
             contribs = [sc for sc in sub.subscription_contribution.all() if sc.success]
             for contrib in contribs:
                 #add all contributions
-                key = contrib.created_on.strftime("%Y/%m")
+                year = contrib.created_on.strftime("%Y")
+                quarter = math.ceil(int(contrib.created_on.strftime("%m"))/3.)
+                key = f"{year}/Q{quarter}"
                 subkey = 'One-Time'
-                if int(contrib.subscription.num_tx_approved) > 1:
-                    if contrib.is_first_in_sequence:
-                        subkey = 'New-Recurring'
-                    else:
-                        subkey = 'Recurring-Recurring'
                 if contrib.subscription.contributor_profile.handle in CLR_PAYOUT_HANDLES:
                     subkey = 'CLR'
                 if key not in month_to_contribution_numbers.keys():
                     month_to_contribution_numbers[key] = {"One-Time": 0, "Recurring-Recurring": 0, "New-Recurring": 0, 'CLR': 0}
                 if contrib.subscription.amount_per_period_usdt:
                     month_to_contribution_numbers[key][subkey] += float(contrib.subscription.amount_per_period_usdt)
-        for pf in self.phantom_funding.all():
-            #add all phantom funds
-            subkey = 'One-Time'
-            key = pf.created_on.strftime("%Y/%m")
-            if key not in month_to_contribution_numbers.keys():
-                month_to_contribution_numbers[key] = {"One-Time": 0, "Recurring-Recurring": 0, "New-Recurring": 0, 'CLR': 0}
-            month_to_contribution_numbers[key][subkey] += float(pf.value)
 
         # sort and return
-        return_me = [["", "Subscription Billing",  "New Subscriptions", "One-Time Contributions", "CLR Matching Funds"]]
+        return_me = [["", "Contributions", "CLR Matching Funds"]]
         for key, val in (sorted(month_to_contribution_numbers.items(), key=lambda kv:(kv[0]))):
-            return_me.append([key, val['Recurring-Recurring'], val['New-Recurring'], val['One-Time'], val['CLR']])
+            return_me.append([key, val['One-Time'], val['CLR']])
         return return_me
 
     @property
@@ -458,7 +704,7 @@ class Grant(SuperModel):
         max_amount = 0
         for ele in self.history_by_month:
             if type(ele[1]) is float:
-                max_amount = max(max_amount, ele[1]+ele[2]+ele[3]+ele[4])
+                max_amount = max(max_amount, ele[1]+ele[2])
         return max_amount
 
     def get_amount_received_with_phantom_funds(self):
@@ -478,7 +724,8 @@ class Grant(SuperModel):
     def url(self):
         """Return grants url."""
         from django.urls import reverse
-        return reverse('grants:details', kwargs={'grant_id': self.pk, 'grant_slug': self.slug})
+        slug = self.slug if self.slug else "-"
+        return reverse('grants:details', kwargs={'grant_id': self.pk, 'grant_slug': slug})
 
     def get_absolute_url(self):
         return self.url
@@ -491,6 +738,110 @@ class Grant(SuperModel):
         grant_contract = web3.eth.contract(Web3.toChecksumAddress(self.contract_address), abi=self.abi)
         return grant_contract
 
+    def cart_payload(self, build_absolute_uri):
+        return {
+            'grant_id': str(self.id),
+            'grant_slug': self.slug,
+            'grant_url': self.url,
+            'grant_title': self.title,
+            'grant_contract_version': self.contract_version,
+            'grant_contract_address': self.contract_address,
+            'grant_token_symbol': self.token_symbol,
+            'grant_admin_address': self.admin_address,
+            'grant_token_address': self.token_address,
+            'grant_logo': self.logo.url if self.logo and self.logo.url else build_absolute_uri(static(f'v2/images/grants/logos/{self.id % 3}.png')),
+            'grant_clr_prediction_curve': self.clr_prediction_curve,
+            'grant_image_css': self.image_css,
+            'is_clr_eligible': self.is_clr_eligible,
+            'clr_round_num': self.clr_round_num,
+            'tenants': self.tenants,
+            'zcash_payout_address': self.zcash_payout_address,
+        }
+
+    def repr(self, user, build_absolute_uri):
+        team_members = serializers.serialize('json', self.team_members.all(),
+                            fields=['handle', 'url', 'profile__lazy_avatar_url']
+                        )
+        grant_type = None
+        if self.grant_type:
+            grant_type = serializers.serialize('json', [self.grant_type],
+                                fields=['name', 'label']
+                            )
+
+        categories = serializers.serialize('json', self.categories.all(),
+                            fields=['category'])
+        return {
+                'id': self.id,
+                'active': self.active,
+                'logo_url': self.logo.url if self.logo and self.logo.url else build_absolute_uri(static(f'v2/images/grants/logos/{self.id % 3}.png')),
+                'details_url': reverse('grants:details', args=(self.id, self.slug)),
+                'title': self.title,
+                'description': self.description,
+                'description_rich': self.description_rich,
+                'last_update': self.last_update,
+                'last_update_natural': naturaltime(self.last_update),
+                'sybil_score': self.sybil_score,
+                'weighted_risk_score': self.weighted_risk_score,
+                'is_clr_active': self.is_clr_active,
+                'clr_round_num': self.clr_round_num,
+                'admin_profile': {
+                    'url': self.admin_profile.url,
+                    'handle': self.admin_profile.handle,
+                    'avatar_url': self.admin_profile.lazy_avatar_url
+                },
+                'favorite': self.favorite(user) if user.is_authenticated else False,
+                'is_on_team': is_grant_team_member(self, user.profile) if user.is_authenticated else False,
+                'clr_prediction_curve': self.clr_prediction_curve,
+                'last_clr_calc_date':  naturaltime(self.last_clr_calc_date) if self.last_clr_calc_date else None,
+                'safe_next_clr_calc_date': naturaltime(self.safe_next_clr_calc_date) if self.safe_next_clr_calc_date else None,
+                'amount_received_in_round': self.amount_received_in_round,
+                'amount_received': self.amount_received,
+                'positive_round_contributor_count': self.positive_round_contributor_count,
+                'monthly_amount_subscribed': self.monthly_amount_subscribed,
+                'is_clr_eligible': self.is_clr_eligible,
+                'slug': self.slug,
+                'url': self.url,
+                'contract_version': self.contract_version,
+                'contract_address': self.contract_address,
+                'token_symbol': self.token_symbol,
+                'admin_address': self.admin_address,
+                'zcash_payout_address': self.zcash_payout_address or '',
+                'token_address': self.token_address,
+                'image_css': self.image_css,
+                'verified': self.twitter_verified,
+                'tenants': self.tenants,
+                'team_members': json.loads(team_members),
+                'metadata': self.metadata,
+                'grant_type': json.loads(grant_type) if grant_type else None,
+                'categories': json.loads(categories),
+                'twitter_handle_1': self.twitter_handle_1,
+                'twitter_handle_2': self.twitter_handle_2,
+                'reference_url': self.reference_url,
+                'github_project_url': self.github_project_url or '',
+                'funding_info': self.funding_info,
+                'link_to_new_grant': self.link_to_new_grant.url if self.link_to_new_grant else self.link_to_new_grant,
+                'region': {'name':self.region, 'label':self.get_region_display()} if self.region and self.region != 'null' else None
+            }
+
+    def favorite(self, user):
+        return Favorite.objects.filter(user=user, grant=self).exists()
+
+    def save(self, update=True, *args, **kwargs):
+        """Override the Grant save to optionally handle modified_on logic."""
+
+        self.clr_prediction_curve = self.calc_clr_prediction_curve
+        self.clr_round_num = self.calc_clr_round_nums
+
+        if self.modified_on < (timezone.now() - timezone.timedelta(minutes=15)):
+            from grants.tasks import update_grant_metadata
+            update_grant_metadata.delay(self.pk)
+
+        from economy.models import get_time
+        if update:
+            self.modified_on = get_time()
+
+        return super(Grant, self).save(*args, **kwargs)
+
 
 class SubscriptionQuerySet(models.QuerySet):
     """Define the Subscription default queryset and manager."""
@@ -501,7 +852,12 @@ class SubscriptionQuerySet(models.QuerySet):
 class Subscription(SuperModel):
     """Define the structure of a subscription agreement."""
 
-    active = models.BooleanField(default=True, help_text=_('Whether or not the Subscription is active.'))
+    TENANT = [
+        ('ETH', 'ETH'),
+        ('ZCASH', 'ZCASH')
+    ]
+
+    active = models.BooleanField(default=True, db_index=True, help_text=_('Whether or not the Subscription is active.'))
     error = models.BooleanField(default=False, help_text=_('Whether or not the Subscription is erroring out.'))
     subminer_comments = models.TextField(default='', blank=True, help_text=_('Comments left by the subminer.'))
     comments = models.TextField(default='', blank=True, help_text=_('Comments left by subscriber.'))
@@ -512,7 +868,7 @@ class Subscription(SuperModel):
         help_text=_('The tx id of the split transfer'),
         blank=True,
     )
-    is_postive_vote = models.BooleanField(default=True, help_text=_('Whether this is positive or negative vote'))
+    is_postive_vote = models.BooleanField(default=True, db_index=True, help_text=_('Whether this is positive or negative vote'))
     split_tx_confirmed = models.BooleanField(default=False, help_text=_('Whether or not the split tx succeeded.'))
 
     subscription_hash = models.CharField(
@@ -544,11 +900,13 @@ class Subscription(SuperModel):
         max_digits=50,
         help_text=_('The real payout frequency of the Subscription in seconds.'),
     )
+    # TODO: REMOVE
     frequency_unit = models.CharField(
         max_length=255,
         default='',
         help_text=_('The text version of frequency units e.g. days, months'),
     )
+    # TODO: REMOVE
     frequency = models.DecimalField(
         default=0,
         decimal_places=0,
@@ -567,31 +925,36 @@ class Subscription(SuperModel):
     )
     gas_price = models.DecimalField(
         default=1,
-        decimal_places=4,
+        decimal_places=18,
         max_digits=50,
         help_text=_('The required gas price for the Subscription.'),
     )
+    # TODO: REMOVE
     new_approve_tx_id = models.CharField(
         max_length=255,
         default='0x0',
         help_text=_('The transaction id for subscription approve().'),
     )
+    # TODO: REMOVE
     end_approve_tx_id = models.CharField(
         max_length=255,
         default='0x0',
         help_text=_('The transaction id for subscription approve().'),
     )
+    # TODO: REMOVE
     cancel_tx_id = models.CharField(
         max_length=255,
         default='0x0',
         help_text=_('The transaction id for cancelSubscription.'),
     )
+    # TODO: REMOVE
     num_tx_approved = models.DecimalField(
         default=1,
         decimal_places=4,
         max_digits=50,
         help_text=_('The number of transactions approved for the Subscription.'),
     )
+    # TODO: REMOVE
     num_tx_processed = models.DecimalField(
         default=0,
         decimal_places=4,
@@ -617,10 +980,12 @@ class Subscription(SuperModel):
         null=True,
         help_text=_('The Subscription contributor\'s Profile.'),
     )
+    # TODO: REMOVE
     last_contribution_date = models.DateTimeField(
         help_text=_('The last contribution date'),
         default=timezone.datetime(1990, 1, 1),
     )
+    # TODO: REMOVE
     next_contribution_date = models.DateTimeField(
         help_text=_('The next contribution date'),
         default=timezone.datetime(1990, 1, 1),
@@ -631,6 +996,7 @@ class Subscription(SuperModel):
         max_digits=64,
         help_text=_('The amount per contribution period in USDT'),
     )
+    tenant = models.CharField(max_length=10, null=True, blank=True, default="ETH", choices=TENANT, help_text="specific tenant in which contribution is made")
 
     @property
     def negative(self):
@@ -645,8 +1011,10 @@ class Subscription(SuperModel):
 
     @property
     def amount_per_period_minus_gas_price(self):
-        amount = float(self.amount_per_period) - float(self.amount_per_period_to_gitcoin)
-        return amount
+        if self.amount_per_period == self.amount_per_period_to_gitcoin:
+            return float(self.amount_per_period)
+
+        return float(self.amount_per_period) - float(self.amount_per_period_to_gitcoin)
 
     @property
     def amount_per_period_to_gitcoin(self):
@@ -910,16 +1278,17 @@ next_valid_timestamp: {next_valid_timestamp}
 
         return result
 
-
     def save_split_tx_to_contribution(self):
         sc = self.subscription_contribution.first()
         sc.split_tx_id = self.split_tx_id
         sc.split_tx_confirmed = self.split_tx_confirmed
         sc.save()
 
-    def successful_contribution(self, tx_id):
-        """Create a contribution object."""
-        from marketing.mails import successful_contribution
+    def successful_contribution(self, tx_id, include_for_clr=True, **kwargs):
+        """
+        Create a contribution object. Only expected keyword argument is checkout_type, which was
+        added as a keyword argument to avoid breaking existing calls to this function
+        """
         self.last_contribution_date = timezone.now()
         self.next_contribution_date = timezone.now() + timedelta(0, int(self.real_period_seconds))
         self.num_tx_processed += 1
@@ -927,7 +1296,8 @@ next_valid_timestamp: {next_valid_timestamp}
             'tx_id': tx_id,
             'subscription': self,
             'split_tx_id': self.split_tx_id,
-            'split_tx_confirmed': self.split_tx_confirmed
+            'split_tx_confirmed': self.split_tx_confirmed,
+            'checkout_type': kwargs['checkout_type'] if 'checkout_type' in kwargs else None
         }
         contribution = Contribution.objects.create(**contribution_kwargs)
         grant = self.grant
@@ -944,16 +1314,63 @@ next_valid_timestamp: {next_valid_timestamp}
         self.save()
         grant.updateActiveSubscriptions()
         grant.save()
-        if not self.negative:
-            successful_contribution(self.grant, self, contribution)
+
+        if grant.pk == 86:
+            # KO 9/28/2020 - per community feedback, contributions that are auto-matched should not count towards
+            # CLR matching, as it gives gitcoin an unfair advantage
+            is_automatic = bool(contribution.subscription.amount_per_period == contribution.subscription.gas_price)
+            from dashboard.models import Profile
+
+            if not include_for_clr:
+                contribution.profile_for_clr = Profile.objects.get(handle='gitcoinbot')
+                contribution.match = False
+            contribution.save()
+
         return contribution
 
 
-@receiver(pre_save, sender=Grant, dispatch_uid="psave_grant")
-def psave_grant(sender, instance, **kwargs):
-    if instance.modified_on < (timezone.now() - timezone.timedelta(minutes=5)):
+    def create_contribution(self, tx_id, is_successful_contribution=True):
+        from marketing.mails import successful_contribution
         from grants.tasks import update_grant_metadata
-        update_grant_metadata.delay(instance.pk)
+
+        now = timezone.now()
+        self.last_contribution_date = now
+        self.next_contribution_date = now
+
+        self.num_tx_processed += 1
+
+        contribution = Contribution()
+
+        contribution.success = False
+        contribution.tx_cleared = False
+        contribution.subscription = self
+        contribution.split_tx_id = self.split_tx_id
+        contribution.split_tx_confirmed = self.split_tx_confirmed
+
+        if tx_id:
+            contribution.tx_id = tx_id
+
+        contribution.save()
+        grant = self.grant
+
+        value_usdt = self.get_converted_amount(False)
+        if value_usdt:
+            self.amount_per_period_usdt = value_usdt
+            grant.amount_received += Decimal(value_usdt)
+
+        if self.num_tx_processed == self.num_tx_approved and value_usdt:
+            grant.monthly_amount_subscribed -= self.get_converted_monthly_amount()
+            self.active = False
+
+        self.save()
+        grant.updateActiveSubscriptions()
+        grant.save()
+        if is_successful_contribution:
+            successful_contribution(self.grant, self, contribution)
+
+        update_grant_metadata.delay(self.pk)
+        return contribution
+
 
 class DonationQuerySet(models.QuerySet):
     """Define the Contribution default queryset and manager."""
@@ -1091,6 +1508,12 @@ class ContributionQuerySet(models.QuerySet):
 class Contribution(SuperModel):
     """Define the structure of a subscription agreement."""
 
+    CHECKOUT_TYPES = [
+        ('eth_std', 'eth_std'),
+        ('eth_zksync', 'eth_zksync'),
+        ('zcash_std', 'zcash_std')
+    ]
+
     success = models.BooleanField(default=True, help_text=_('Whether or not success.'))
     tx_cleared = models.BooleanField(default=False, help_text=_('Whether or not tx cleared.'))
     tx_override = models.BooleanField(default=False, help_text=_('Whether or not the tx success and tx_cleared have been manually overridden. If this setting is True, update_tx_status will not change this object.'))
@@ -1135,6 +1558,25 @@ class Contribution(SuperModel):
         help_text=_('The why or why not validator passed'),
     )
 
+    profile_for_clr = models.ForeignKey(
+        'dashboard.Profile',
+        related_name='clr_pledges',
+        on_delete=models.CASCADE,
+        help_text=_('The profile to attribute this contribution to..'),
+        null=True,
+        blank=True,
+    )
+    checkout_type = models.CharField(
+        max_length=30,
+        null=True,
+        help_text=_('The checkout method used while making the contribution'),
+        blank=True,
+        choices=CHECKOUT_TYPES
+    )
+    anonymous = models.BooleanField(default=False, help_text=_('Whether users can view the profile for this project or not'))
+
+    def get_absolute_url(self):
+        return self.subscription.grant.url + '?tab=transactions'
 
     def __str__(self):
         """Return the string representation of this object."""
@@ -1156,47 +1598,85 @@ class Contribution(SuperModel):
             return self.subscription.contributor_profile.id
 
     def update_tx_status(self):
-        """Updates tx status."""
-        from economy.tx import grants_transaction_validator
-        from dashboard.utils import get_tx_status
-        from economy.tx import getReplacedTX
-        if self.tx_override:
-            return
+        """Updates tx status for Ethereum contributions."""
+        try:
+            from economy.tx import grants_transaction_validator
+            from dashboard.utils import get_tx_status
+            from economy.tx import getReplacedTX
 
-        # handle replace of tx_id
-        if self.tx_id:
-            tx_status, _ = get_tx_status(self.tx_id, self.subscription.network, self.created_on)
-            if tx_status in ['pending', 'dropped', 'unknown', '']:
-                new_tx = getReplacedTX(self.tx_id)
-                if new_tx:
-                    self.tx_id = new_tx
-                else:
-                    # TODO: do stuff related to long running pending txns
-                    pass
-                return
-        # handle replace of split_tx_id
-        if self.split_tx_id:
-            split_tx_status, _ = get_tx_status(self.split_tx_id, self.subscription.network, self.created_on)
-            if split_tx_status in ['pending', 'dropped', 'unknown', '']:
-                new_tx = getReplacedTX(self.split_tx_id)
-                if new_tx:
-                    self.split_tx_id = new_tx
+            # If `tx_override` is True, we don't run the validator for this contribution
+            if self.tx_override:
                 return
 
-        # actually validate token transfers
-        response = grants_transaction_validator(self)
-        if len(response['originator']):
-            self.originated_address = response['originator'][0]
-        self.validator_passed = response['validation']['passed']
-        self.validator_comment = response['validation']['comment']
-        self.tx_cleared = True
-        self.split_tx_confirmed = True
-        self.success = self.validator_passed
+            # Execute transaction validator based on checkout type
+            network = self.subscription.network
+            if self.checkout_type == 'eth_zksync':
+                # zkSync checkout using their zksync-checkout library
 
-        if self.success:
-            print("TODO: do stuff related to successful contribs, like emails")
-        else:
-            print("TODO: do stuff related to failed contribs, like emails")
+                # Get the tx hash
+                if not self.split_tx_id.startswith('sync-tx:') or len(self.split_tx_id) != 72:
+                    # Tx hash should start with `sync-tx:` and have a 64 character hash (no 0x prefix)
+                    raise Exception('Unsupported zkSync transaction hash format')
+                tx_hash = self.split_tx_id.replace('sync-tx:', '0x') # replace `sync-tx:` prefix with `0x`
+
+                # Get transaction data with zkSync's API: https://zksync.io/api/v0.1.html#transaction-details
+                base_url = 'https://rinkeby-api.zksync.io/api/v0.1' if network == 'rinkeby' else 'https://api.zksync.io/api/v0.1'
+                r = requests.get(f"{base_url}/transactions_all/{tx_hash}")
+                r.raise_for_status()
+                tx_data = r.json() # zkSync transaction data
+
+                # Update contribution values based on transaction data
+                self.originated_address = tx_data['from'] # assumes sender is originator
+                self.success = tx_data['fail_reason'] is None # if no failure string, transaction was successful
+                self.validator_passed = True
+                self.split_tx_confirmed = True
+                self.tx_cleared = True
+                self.validator_comment = "zkSync checkout. Success" if self.success else f"zkSync Checkout. {tx_data['fail_reason']}"
+
+            elif self.checkout_type == 'eth_std':
+                # Standard L1 checkout using the BulkCheckout contract
+
+                # Prepare web3 provider
+                PROVIDER = "wss://" + network + ".infura.io/ws/v3/" + settings.INFURA_V3_PROJECT_ID
+                w3 = Web3(Web3.WebsocketProvider(PROVIDER))
+
+                # Handle replaced transactions
+                split_tx_status, _ = get_tx_status(self.split_tx_id, self.subscription.network, self.created_on)
+                if split_tx_status in ['pending', 'dropped', 'unknown', '']:
+                    new_tx = getReplacedTX(self.split_tx_id)
+                    if new_tx:
+                        self.split_tx_id = new_tx
+                    else:
+                        print('TODO: do stuff related to long running pending txns')
+                    return
+
+                # Validate that the token transfers occurred
+                response = grants_transaction_validator(self, w3)
+                if len(response['originator']):
+                    self.originated_address = response['originator'][0]
+                self.validator_passed = response['validation']['passed']
+                self.validator_comment = response['validation']['comment']
+                self.tx_cleared = response['tx_cleared']
+                self.split_tx_confirmed = response['split_tx_confirmed']
+                self.success = self.validator_passed
+
+            else:
+                # This validator is only for eth_std and eth_zksync, so exit for other contribution types
+                return
+
+            # Validator complete!
+
+            if self.success:
+                print("TODO: do stuff related to successful contribs, like emails")
+            else:
+                print("TODO: do stuff related to failed contribs, like emails")
+        except Exception as e:
+            self.validator_passed = False
+            self.validator_comment = str(e)
+            print(f"Exception: {self.validator_comment}")
+            self.tx_cleared = False
+            self.split_tx_confirmed = False
+            self.success = False
 
 
 @receiver(post_save, sender=Contribution, dispatch_uid="psave_contrib")
@@ -1228,6 +1708,10 @@ def psave_contrib(sender, instance, **kwargs):
 @receiver(pre_save, sender=Contribution, dispatch_uid="presave_contrib")
 def presave_contrib(sender, instance, **kwargs):
 
+    if not instance.profile_for_clr:
+        if instance.subscription:
+            instance.profile_for_clr = instance.subscription.contributor_profile
+
     ele = instance
     sub = ele.subscription
     grant = sub.grant
@@ -1236,6 +1720,8 @@ def presave_contrib(sender, instance, **kwargs):
         'logo': grant.logo.url if grant.logo else None,
         'url': grant.url,
         'title': grant.title,
+        'amount_per_period_minus_gas_price': float(instance.subscription.amount_per_period_minus_gas_price),
+        'amount_per_period_to_gitcoin': float(instance.subscription.amount_per_period_to_gitcoin),
         'created_on': ele.created_on.strftime('%Y-%m-%d'),
         'frequency': int(sub.frequency),
         'frequency_unit': sub.frequency_unit,
@@ -1243,6 +1729,7 @@ def presave_contrib(sender, instance, **kwargs):
         'token_symbol': sub.token_symbol,
         'amount_per_period_usdt': float(sub.amount_per_period_usdt),
         'amount_per_period': float(sub.amount_per_period),
+        'admin_address': grant.admin_address,
         'tx_id': ele.tx_id,
     }
 
@@ -1264,6 +1751,7 @@ class CLRMatch(SuperModel):
         null=False,
         help_text=_('The associated Grant.'),
     )
+    has_passed_kyc = models.BooleanField(default=False, help_text=_('Has this grant gone through KYC?'))
     ready_for_test_payout = models.BooleanField(default=False, help_text=_('Ready for test payout or not'))
     test_payout_tx = models.CharField(
         max_length=255,
@@ -1328,10 +1816,22 @@ class MatchPledge(SuperModel):
         max_digits=50,
         help_text=_('The matching pledge amount in DAI.'),
     )
-    pledge_type = models.CharField(max_length=15, choices=PLEDGE_TYPES, default='tech', help_text=_('CLR pledge type'))
+    pledge_type = models.CharField(max_length=15, null=True, blank=True, choices=PLEDGE_TYPES, help_text=_('CLR pledge type'))
     comments = models.TextField(default='', blank=True, help_text=_('The comments.'))
     end_date = models.DateTimeField(null=False, default=next_month)
-    data = models.TextField(blank=True)
+    data = JSONField(null=True, blank=True)
+    clr_round_num = models.ForeignKey(
+        'grants.GrantCLR',
+        on_delete=models.CASCADE,
+        help_text=_('Pledge CLR Round.'),
+        null=True,
+        blank=True
+    )
+
+    @property
+    def data_json(self):
+        import json
+        return json.loads(self.data)
 
     def __str__(self):
         """Return the string representation of this object."""
@@ -1399,3 +1899,163 @@ class CartActivity(SuperModel):
 
     def __str__(self):
         return f'{self.action} {self.grant.id if self.grant else "bulk"} from the cart {self.profile.handle}'
+
+
+class CollectionsQuerySet(models.QuerySet):
+    """Handle the manager queryset for Collections."""
+
+    def visible(self):
+        """Filter results down to visible collections only."""
+        return self.filter(hidden=False)
+
+    def keyword(self, keyword):
+        if not keyword:
+            return self
+        return self.filter(
+            Q(description__icontains=keyword) |
+            Q(title__icontains=keyword) |
+            Q(profile__handle__icontains=keyword)
+        )
+
+
+class GrantCollection(SuperModel):
+    grants = models.ManyToManyField(blank=True, to=Grant, help_text=_('References to grants related to this collection'))
+    profile = models.ForeignKey('dashboard.Profile', help_text=_('Owner of the collection'), related_name='curator', on_delete=models.CASCADE)
+    title = models.CharField(max_length=255, help_text=_('Name of the collection'))
+    description = models.TextField(default='', blank=True, help_text=_('The description of the collection'))
+    cover = models.ImageField(upload_to=get_upload_filename, null=True,blank=True, max_length=500, help_text=_('Collection image'))
+    hidden = models.BooleanField(default=False, help_text=_('Hide the collection'), db_index=True)
+    cache = JSONField(default=dict, blank=True, help_text=_('Easy access to grant info'),)
+    featured = models.BooleanField(default=False, help_text=_('Show grant as featured'))
+    objects = CollectionsQuerySet.as_manager()
+    curators = models.ManyToManyField(blank=True, to='dashboard.Profile', help_text=_('List of allowed curators'))
+
+    def generate_cache(self):
+        grants = self.grants.all()
+
+        cache = {
+            'count': grants.count(),
+            'grants': [{
+                'id': grant.id,
+                'logo': grant.logo.url if grant.logo and grant.logo.url else f'v2/images/grants/logos/{grant.id % 3}.png',
+            } for grant in grants]
+        }
+
+        try:
+            cover = generate_collection_thumbnail(self, 348, 175)
+            filename = f'thumbnail_{self.id}.png'
+            buffer = BytesIO()
+            cover.save(fp=buffer, format='PNG')
+            tempfile = ContentFile(buffer.getvalue())
+            image_file = InMemoryUploadedFile(tempfile, None, filename, 'image/png', tempfile.tell, None)
+            self.cover.save(filename, image_file)
+        except Exception:
+            print('ERROR: failed build thumbnail')
+            traceback.print_exc()
+
+        print(self.cover)
+        self.cache = cache
+        self.save()
+
+    def to_json_dict(self, build_absolute_uri):
+        curators = [{
+            'url': curator.url,
+            'handle': curator.handle,
+            'avatar_url': curator.lazy_avatar_url
+        } for curator in self.curators.all()]
+
+        owner = {
+            'url': self.profile.url,
+            'handle': self.profile.handle,
+            'avatar_url': self.profile.lazy_avatar_url
+        }
+
+        grants = self.cache.get('grants', 0)
+
+        if grants:
+            grants = [{
+                **grant,
+                'logo': build_absolute_uri(static(grant['logo'])) if 'v2/images' in grant['logo'] else grant['logo']
+            } for grant in grants]
+        return {
+            'id': self.id,
+            'owner': owner,
+            'title': self.title,
+            'description': self.description,
+            'cover': self.cover.url if self.cover else '',
+            'count': self.cache.get('count', 0),
+            'grants': grants,
+            'curators': curators + [owner]
+        }
+
+class GrantStat(SuperModel):
+    SNAPSHOT_TYPES = [
+        ('total', 'total'),
+        ('increment', 'increment')
+    ]
+
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name='stats',
+                              help_text=_('Grant to add stats for this grant'))
+    data = JSONField(default=dict, blank=True, help_text=_('Stats for this Grant'))
+    snapshot_type = models.CharField(
+        max_length=50,
+        blank=False,
+        null=False,
+        help_text=_('Snapshot Type'),
+        db_index=True,
+        choices=SNAPSHOT_TYPES,
+    )
+
+    def __str__(self):
+        return f'{self.snapshot_type} {self.created_on} for {self.grant.title}'
+
+
+class GrantCLRCalculation(SuperModel):
+
+    latest = models.BooleanField(default=False, db_index=True, help_text="Is this calc the latest?")
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name='clr_calculations',
+                              help_text=_('The grant'))
+    grantclr = models.ForeignKey(GrantCLR, on_delete=models.CASCADE, related_name='clr_calculations',
+                              help_text=_('The grant CLR Round'))
+
+    clr_prediction_curve = ArrayField(
+        ArrayField(
+            models.FloatField(),
+            size=2,
+        ), blank=True, default=list, help_text=_('5 point curve to predict CLR donations.'))
+
+    def __str__(self):
+        return f'{self.created_on} for g:{self.grant.pk} / gclr:{self.grantclr.pk} : {self.clr_prediction_curve}'
+
+
+class GrantBrandingRoutingPolicy(SuperModel):
+    """
+    This manages the background that would be put on a grant page (or grant CLR based on a regex matching in the URL)
+
+    For a grant, there are several models and views that handle different kinds of grants, CLRs  and categories.
+    This routing policy model sits in the middle and handles the banner and background image of specific sub-url group
+    """
+    policy_name = models.CharField(
+        max_length=25,
+        help_text=_("name to make it easier to identify"),
+        blank=True,
+        null=True
+    )
+    url_pattern = models.CharField(max_length=50, help_text=_("A regex url pattern"))
+    banner_image = models.ImageField(
+        upload_to=get_upload_filename,
+        help_text=_('The banner image for a grant page'),
+    )
+    priority = models.PositiveSmallIntegerField(
+        help_text=_("The priority ranking of this image 1-255. Higher priorities would be loaded first")
+    )
+    background_image = models.ImageField(
+        upload_to=get_upload_filename,
+        help_text=_('Background image'),
+        blank=True,
+        null=True
+    )
+    inline_css = models.TextField(default='', blank=True, help_text=_('Inline css to customize the banner fit'))
+
+    def __str__(self):
+        return f'{self.url_pattern} >> {self.priority}'

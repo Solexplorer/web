@@ -900,12 +900,25 @@ body.green.offer_view .announce {
   text-transform: uppercase;
   cursor: pointer;
 }
-.townsquare_block-header::after {
-  content: ""
+
+.text-mode-color {
+  color: var(--townsquare-block-header-color);
 }
-.townsquare_block-header.closed::after {
-  content: "^"
+
+.dark-mode .modal-content .btn-radio,
+.dark-mode .modal-content .close,
+.dark-mode .vs__search,
+.dark-mode .vs__selected,
+.dark-mode .vs__dropdown-option,
+.dark-mode .vs__search:focus {
+  color: var(--default-text-color);
 }
+
+.dark-mode .modal-content .btn-radio:hover {
+  color: var(--default-text-color);
+}
+
+
 #status .btn-group-toggle .btn-radio {
   background-color: var(--badge-blue-bg);
   color: var(--badge-blue-text);
@@ -994,7 +1007,7 @@ body.green.offer_view .announce {
   font-size: 12px;
 }
 
-.townsquare_nav-list.tribe .avatar {
+.townsquare_nav-list .tribe .avatar {
   width: 20px;
   height: 20px;
   margin-right: 4px;
@@ -1219,7 +1232,7 @@ body.green.offer_view .announce {
 .activity.hackathon_new_hacker {
   position: relative;
   box-sizing: border-box;
-  z-index: 2;
+  z-index: 0;
 }
 
 .activity.hackathon_new_hacker:before {
@@ -1245,26 +1258,15 @@ body.green.offer_view .announce {
   z-index: -2;
 }
 
-.activity.hackathon_new_hacker .activity-avatar::after {
+.activity.hackathon_new_hacker #profile-avatar-link::after {
   height: 6.1rem;
   content: '';
   background-image: url(/static/v2/images/townsquare-nh.svg);
   width: 6.1rem;
   position: absolute;
-  top: -24px;
-  left: 8px;
+  top: -1.5rem;
   z-index: -1;
-}
-
-.activity.hackathon_new_hacker .activity_detail::after {
-  height: 100%;
-  content: '';
-  background: url(/static/v2/images/townsqure-party.png) 0 0 no-repeat;
-  width: 100%;
-  position: absolute;
-  top: 55px;
-  right: -309px;
-  z-index: -1;
+  margin-left: -3px;
 }
 
 .new_hackathon_project {
@@ -1353,6 +1355,34 @@ body.green.offer_view .announce {
 .dark-mode .web3modal-modal-card {
   background: var(--gc-dark-violet);
   color: white;
+}
+
+.dark-mode .modal-content{
+  background: var(--bg-shade-0);
+}
+
+.dark-mode .vs__dropdown-menu {
+  background: var(--bg-shade-1);
+  color: var(--default-text-color);
+}
+
+.dark-mode .vs__dropdown-toggle {
+  border-color: var(--default-text-color);
+}
+
+.dark-mode .vs__clear,
+.dark-mode .vs__open-indicator {
+  fill: var(--default-text-color);
+}
+
+.dark-mode .display-light {
+  display: none;
+}
+.display-dark {
+  display: none;
+}
+.dark-mode .display-dark {
+  display: block;
 }
 
 .tag-list .tag-list__item {

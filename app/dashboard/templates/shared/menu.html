@@ -33,7 +33,7 @@
       </a>
       <div class="dropdown-menu shadow-lg" aria-labelledby="dropdownProducts">
         <div class="gc-megamenu-content">
-          <div class="row">
+          <div class="row justify-content-center">
             <ul class="col-md-4 col-lg-2 list-unstyled {% if '/bount' in request.path or '/explorer' in request.path %}gc-megamenu-active{% endif %}">
               <li>
                 <a class="text-reset" href="{% url 'funder_bounties' %}">
@@ -84,31 +84,10 @@
                 <a class="dropdown-item dropdown-item-small" href="{% url 'grants:grants' %}">{% trans "Explore Grants" %}</a>
               </li>
               <li>
-                <a class="dropdown-item dropdown-item-small" href="{% url 'grants:leaderboard' %}">{% trans "Grants Leaderboard" %}</a>
-              </li>
-              <li>
                 <a class="dropdown-item dropdown-item-small" href="{% url 'grants:new' %}">{% trans "Create Grant" %}</a>
               </li>
               <li>
                 <a class="dropdown-item dropdown-item-small" href="{% url 'grants:quickstart' %}">{% trans "About Grants" %}</a>
-              </li>
-            </ul>
-            <ul class="col-md-4 col-lg-2 list-unstyled">
-              <li>
-                <a class="text-reset" href="https://codefund.app/">
-                  <img class="mw-100 logo-static" src="{% static "v2/images/top-bar/codefund_symbol_dark.svg" %}" alt="Codefund" height="48">
-                  <b class="gc-megamenu-title">{% trans "Codefund" %}</b>
-                </a>
-                <p class="px-2 m-0 mb-2 text-wrap font-smaller-2">{% trans "Ethical ads to power Open Source" %}</p>
-              </li>
-              <li>
-                <a class="dropdown-item dropdown-item-small" href="https://codefund.io/advertisers">{% trans "Advertise With Us" %}</a>
-              </li>
-              <li>
-                <a class="dropdown-item dropdown-item-small" href="https://codefund.io/publishers">{% trans "Become a Publisher" %}</a>
-              </li>
-              <li>
-                <a class="dropdown-item dropdown-item-small" href="https://codefund.io">{% trans "About Codefund" %}</a>
               </li>
             </ul>
 
@@ -147,6 +126,19 @@
               </li>
             </ul>
 
+            <ul class="col-md-4 col-lg-2 list-unstyled {% if '/kernel' in request.path %}gc-megamenu-active{% endif %}">
+              <li>
+                <a class="text-reset" href="https://kernel.community">
+                  <img class="mw-100 logo-static p-2" src="{% static 'v2/images/top-bar/kernel.svg' %}" alt="Kudos" height="48">
+                  <b class="gc-megamenu-title">{% trans "Kernel" %}</b>
+                </a>
+                <p class="px-2 m-0 mb-2 text-wrap font-smaller-2">{% trans "An web3-native, community-centric, accelerator." %}</p>
+              </li>
+              <li>
+                <a class="dropdown-item dropdown-item-small" href="https://kernel.community">{% trans "Explore Kernel" %}</a>
+              </li>
+            </ul>
+
           </div>
         </div>
       </div>
@@ -154,7 +146,7 @@
     <div class="nav-item dropdown interior gc-megamenu-fw">
       <a class="nav-link dropdown-toggle" href="#" id="dropdownCommunity" role="button"
           data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
-        {% trans "Tribes" %}
+        {% trans "Community" %}
       </a>
       <div class="dropdown-menu shadow-lg" id="" aria-labelledby="dropdownCommunity">
         <div class="gc-megamenu-content">
@@ -200,8 +192,8 @@
                   <div class="carousel-item active">
                     <h5>Chat with the community</h5>
                     <p>Meet fellow developers, designers, futurists and more. Collaborate and BUIDL awesome projects together.</p>
-                    <a class="btn btn-gc-blue" href="{% url 'landing_chat' %}">
-                      {% trans "Go to Chat" %}
+                    <a class="btn btn-gc-blue" href="https://discord.gg/jWUzf7b8Yr">
+                      {% trans "Go to Discord" %}
                     </a>
                   </div>
                   <div class="carousel-item">
@@ -236,13 +228,13 @@
 
             <ul class="col-md-3 col-lg-2 list-unstyled offset-lg-2">
               <li>
-                <a class="dropdown-item" href="{% url "about" %}">
-                  {% trans "About" %}
+                <a class="dropdown-item" href="{% url "mission" %}">
+                  {% trans "Mission" %}
                 </a>
               </li>
               <li>
                 <a class="dropdown-item" href="{% url 'products' %}">
-                  {% trans "Gitcoin Products" %}
+                  {% trans "Products" %}
                 </a>
               </li>
               <li>
@@ -251,8 +243,8 @@
                 </a>
               </li>
               <li>
-                <a class="dropdown-item" href="{% url "mission" %}">
-                  {% trans "Mission" %}
+                <a class="dropdown-item" href="{% url "about" %}">
+                  {% trans "About" %}
                 </a>
               </li>
               <li>
@@ -271,11 +263,6 @@
               <li>
                 <a class="dropdown-item" href="{% url "blog" %}">
                   {% trans "Blog" %}
-                </a>
-              </li>
-              <li>
-                <a class="dropdown-item" href="{% url "not_a_token" %}">
-                  {% trans "No Utility Token ICO" %}
                 </a>
               </li>
               <li>
